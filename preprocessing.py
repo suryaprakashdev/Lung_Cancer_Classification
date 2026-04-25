@@ -1,14 +1,17 @@
 """
 preprocessing.py
 ----------------
-Stage 1: Convert raw LIDC-IDRI DICOM files → labelled PNG patches.
+Stage 1: Convert raw LIDC-IDRI DICOM files → labelled .npy patches.
+
+Saves raw float32 HU-calibrated patches so that windowing / normalisation
+can happen at training time via MONAI transforms (no quantisation loss).
 
 Steps:
   1. Organise raw DICOMs into pylidc-compatible folder structure
   2. Configure pylidc to locate the data
   3. Iterate over every scan, cluster radiologist annotations into nodules
-  4. Apply lung-windowing + normalisation, crop a 2-D patch, save to
-     Benign_0/ or Malignant_1/ directories
+  4. Crop a 2-D patch, save raw HU values to
+     Benign_0/ or Malignant_1/ directories as .npy files
 
 Run:
   python preprocessing.py --raw_dir /path/to/LIDC-IDRI \
@@ -211,11 +214,11 @@ def extract_nodule_patches(raw_dir: str, out_dir: str,
                     skipped += 1
                     continue
 
-                final_img = apply_lung_window(cropped)
-
+                # Save raw HU patch — windowing happens at training
+                # time via MONAI transforms (no quantisation loss)
                 folder   = malignant_dir if is_malignant else benign_dir
-                filename = f"{scan.patient_id}_nodule_{i}_malig_{avg_malignancy:.1f}.png"
-                cv2.imwrite(os.path.join(folder, filename), final_img)
+                filename = f"{scan.patient_id}_nodule_{i}_malig_{avg_malignancy:.1f}.npy"
+                np.save(os.path.join(folder, filename), cropped.astype(np.float32))
                 nodule_count += 1
 
             _checkpoint(checkpoint_file, processed_ids, scan.patient_id)

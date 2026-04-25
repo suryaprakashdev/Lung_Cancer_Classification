@@ -36,7 +36,7 @@ import torch.nn as nn
 from sklearn.metrics import roc_auc_score, f1_score, confusion_matrix
 from tqdm import tqdm
 
-from dataset import build_dataloaders
+from monai_dataset import build_dataloaders
 from models  import get_model, MODEL_REGISTRY
 
 
@@ -57,9 +57,9 @@ def evaluate(model: nn.Module,
     total_loss = 0.0
 
     with torch.no_grad():
-        for imgs, labels in loader:
-            imgs   = imgs.to(device)
-            labels = labels.float().unsqueeze(1).to(device)
+        for batch in loader:
+            imgs   = batch["image"].to(device)
+            labels = batch["label"].float().unsqueeze(1).to(device)
             out    = model(imgs)
             total_loss += criterion(out, labels).item()
             probs = torch.sigmoid(out).cpu().numpy()
@@ -128,9 +128,9 @@ def train_model(name:         str,
                     desc=f"[{name}] Epoch {epoch+1:02d}/{epochs}",
                     leave=False)
 
-        for imgs, labels in loop:
-            imgs   = imgs.to(device)
-            labels = labels.float().unsqueeze(1).to(device)
+        for batch in loop:
+            imgs   = batch["image"].to(device)
+            labels = batch["label"].float().unsqueeze(1).to(device)
 
             optimizer.zero_grad()
             loss = criterion(model(imgs), labels)

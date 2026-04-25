@@ -30,26 +30,40 @@ import numpy as np
 import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
-from PIL import Image
 from sklearn.metrics import (roc_auc_score, f1_score,
                              confusion_matrix, roc_curve)
-from torchvision import transforms
 
-from dataset import build_dataloaders
-from models  import get_model, MODEL_REGISTRY
+from monai.transforms import (
+    Compose,
+    EnsureChannelFirst,
+    NormalizeIntensity,
+    RepeatChannel,
+    Resize,
+    ScaleIntensityRange,
+    ToTensor,
+)
+
+from monai_dataset import build_dataloaders, LUNG_HU_MIN, LUNG_HU_MAX
+from models import get_model, MODEL_REGISTRY
 
 
 # ──────────────────────────────────────────────
-#  Shared inference transform (same as val)
+#  Shared inference transform (same as val — MONAI)
 # ──────────────────────────────────────────────
 
-_INFER_TRANSFORM = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.Grayscale(num_output_channels=3),
-    transforms.ToTensor(),
-    transforms.Normalize([0.485, 0.456, 0.406],
-                         [0.229, 0.224, 0.225]),
-])
+def _build_infer_transform() -> Compose:
+    """Non-dict MONAI transform for single-image Grad-CAM loading."""
+    return Compose([
+        EnsureChannelFirst(),
+        ScaleIntensityRange(
+            a_min=LUNG_HU_MIN, a_max=LUNG_HU_MAX,
+            b_min=0.0, b_max=1.0, clip=True,
+        ),
+        Resize(spatial_size=(224, 224), mode="bilinear"),
+        RepeatChannel(repeats=3),
+        NormalizeIntensity(channel_wise=True),
+        ToTensor(),
+    ])
 
 
 # ──────────────────────────────────────────────
@@ -76,8 +90,9 @@ def test_model(model: nn.Module,
     all_labels, all_probs = [], []
 
     with torch.no_grad():
-        for imgs, labels in test_loader:
-            imgs   = imgs.to(device)
+        for batch in test_loader:
+            imgs   = batch["image"].to(device)
+            labels = batch["label"]
             probs  = torch.sigmoid(model(imgs)).cpu().numpy()
             all_probs.extend(probs.flatten())
             all_labels.extend(labels.numpy())
@@ -218,16 +233,38 @@ def load_image_for_gradcam(
         image_path: str,
         device: torch.device
 ) -> Tuple[np.ndarray, np.ndarray, torch.Tensor]:
-    """Return (original_rgb, resized_rgb_224, input_tensor)."""
-    img = cv2.imread(image_path)
-    if img is None:
-        raise FileNotFoundError(f"Image not found: {image_path}")
-    img_rgb     = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    img_resized = cv2.resize(img_rgb, (224, 224))
+    """
+    Return (original_rgb_or_gray, resized_224, input_tensor).
 
-    pil_img      = Image.fromarray(img_resized)
-    input_tensor = _INFER_TRANSFORM(pil_img).unsqueeze(0).to(device)
-    return img_rgb, img_resized, input_tensor
+    Supports both .npy (raw HU) and .png/.jpg (pre-windowed) inputs.
+    """
+    ext = os.path.splitext(image_path)[1].lower()
+
+    if ext == ".npy":
+        # Raw HU patch — apply full MONAI transform
+        img_raw = np.load(image_path).astype(np.float32)
+        img_display = np.clip(
+            (img_raw - LUNG_HU_MIN) / (LUNG_HU_MAX - LUNG_HU_MIN) * 255,
+            0, 255,
+        ).astype(np.uint8)
+        img_display_rgb = cv2.cvtColor(img_display, cv2.COLOR_GRAY2RGB)
+        img_resized = cv2.resize(img_display_rgb, (224, 224))
+        transform = _build_infer_transform()
+        tensor = transform(img_raw)  # (3, 224, 224)
+    else:
+        # Pre-windowed image (legacy PNG/JPEG)
+        img = cv2.imread(image_path)
+        if img is None:
+            raise FileNotFoundError(f"Image not found: {image_path}")
+        img_display_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        img_resized = cv2.resize(img_display_rgb, (224, 224))
+        # For legacy images, use simple float conversion
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.float32)
+        transform = _build_infer_transform()
+        tensor = transform(gray)  # (3, 224, 224)
+
+    input_tensor = tensor.unsqueeze(0).to(device)
+    return img_display_rgb, img_resized, input_tensor
 
 
 def get_bbox_from_cam(cam: np.ndarray,
