@@ -51,19 +51,28 @@ from models import get_model, MODEL_REGISTRY
 #  Shared inference transform (same as val — MONAI)
 # ──────────────────────────────────────────────
 
-def _build_infer_transform() -> Compose:
-    """Non-dict MONAI transform for single-image Grad-CAM loading."""
+def _build_infer_transform_dict():
+    """Dict-based MONAI transform (skip EnsureChannelFirstd — we'll reshape manually)."""
+    from monai.transforms import (
+        Compose, ScaleIntensityRanged,
+        Resized, RepeatChanneld, NormalizeIntensityd, ToTensord,
+    )
+    from monai_dataset import LUNG_HU_MIN, LUNG_HU_MAX
+    
     return Compose([
-        EnsureChannelFirst(),
-        ScaleIntensityRange(
+        # NO EnsureChannelFirstd — manually reshape array instead
+        ScaleIntensityRanged(
+            keys="image",
             a_min=LUNG_HU_MIN, a_max=LUNG_HU_MAX,
             b_min=0.0, b_max=1.0, clip=True,
         ),
-        Resize(spatial_size=(224, 224), mode="bilinear"),
-        RepeatChannel(repeats=3),
-        NormalizeIntensity(channel_wise=True),
-        ToTensor(),
+        Resized(keys="image", spatial_size=(224, 224), mode="bilinear"),
+        RepeatChanneld(keys="image", repeats=3),
+        NormalizeIntensityd(keys="image", channel_wise=True),
+        ToTensord(keys="image"),
     ])
+
+ 
 
 
 # ──────────────────────────────────────────────
@@ -229,39 +238,48 @@ class GradCAMWrapper:
             h.remove()
 
 
-def load_image_for_gradcam(
-        image_path: str,
-        device: torch.device
-) -> Tuple[np.ndarray, np.ndarray, torch.Tensor]:
-    """
-    Return (original_rgb_or_gray, resized_224, input_tensor).
-
-    Supports both .npy (raw HU) and .png/.jpg (pre-windowed) inputs.
-    """
+def load_image_for_gradcam(image_path: str, device):
+    """Load and preprocess image for Grad-CAM."""
+    import os
+    import cv2
+    import numpy as np
+    import torch
+    from monai_dataset import LUNG_HU_MIN, LUNG_HU_MAX
+    
     ext = os.path.splitext(image_path)[1].lower()
 
     if ext == ".npy":
-        # Raw HU patch — apply full MONAI transform
         img_raw = np.load(image_path).astype(np.float32)
+        
+        # Display version
         img_display = np.clip(
             (img_raw - LUNG_HU_MIN) / (LUNG_HU_MAX - LUNG_HU_MIN) * 255,
             0, 255,
         ).astype(np.uint8)
         img_display_rgb = cv2.cvtColor(img_display, cv2.COLOR_GRAY2RGB)
         img_resized = cv2.resize(img_display_rgb, (224, 224))
-        transform = _build_infer_transform()
-        tensor = transform(img_raw)  # (3, 224, 224)
+        
+        # ✓ Manually add channel dimension: (H, W) → (1, H, W)
+        img_raw_ch = np.expand_dims(img_raw, axis=0)
+        
+        transform = _build_infer_transform_dict()
+        data = transform({"image": img_raw_ch})
+        tensor = data["image"]
+        
     else:
-        # Pre-windowed image (legacy PNG/JPEG)
         img = cv2.imread(image_path)
         if img is None:
             raise FileNotFoundError(f"Image not found: {image_path}")
         img_display_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         img_resized = cv2.resize(img_display_rgb, (224, 224))
-        # For legacy images, use simple float conversion
+        
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.float32)
-        transform = _build_infer_transform()
-        tensor = transform(gray)  # (3, 224, 224)
+        # ✓ Manually add channel dimension
+        gray_ch = np.expand_dims(gray, axis=0)
+        
+        transform = _build_infer_transform_dict()
+        data = transform({"image": gray_ch})
+        tensor = data["image"]
 
     input_tensor = tensor.unsqueeze(0).to(device)
     return img_display_rgb, img_resized, input_tensor
