@@ -41,7 +41,7 @@ class Preprocessor:
 
         # Build the exact MONAI transform chain matching training val transforms
         self.hu_transform = Compose([
-            EnsureChannelFirst(),
+            EnsureChannelFirst(channel_dim="no_channel"),
             ScaleIntensityRange(
                 a_min=self.cfg.lung_hu_min,
                 a_max=self.cfg.lung_hu_max,
@@ -57,7 +57,7 @@ class Preprocessor:
 
         # For pre-windowed images (0-255 range), scale to [0, 1] first
         self.image_transform = Compose([
-            EnsureChannelFirst(),
+            EnsureChannelFirst(channel_dim="no_channel"),
             ScaleIntensityRange(
                 a_min=0.0,
                 a_max=255.0,

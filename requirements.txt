@@ -10,7 +10,7 @@ torchvision>=0.16.0
 numpy==1.26.4        # pinned: pylidc is incompatible with NumPy 2.x
 pydicom>=2.4.0
 pylidc>=0.2.3
-monai>=1.3.0         # medical imaging transforms (replaces torchvision for CT)
+monai[all]>=1.3.0    # medical imaging transforms, networks, losses, inferers
 
 # ──────────────────────────────────────────────
 # Image processing
@@ -22,6 +22,7 @@ Pillow>=10.0.0
 # ML utilities
 # ──────────────────────────────────────────────
 scikit-learn>=1.3.0
+scipy>=1.11.0        # 3D connected components (scipy.ndimage.label)
 
 # ──────────────────────────────────────────────
 # Grad-CAM (optional – used in postprocessing.py)
