@@ -1,62 +1,85 @@
 """
-preprocessing.py
-----------------
-Phase 1: MONAI-native 3D preprocessing pipeline for the LIDC-IDRI dataset.
+preprocessing_3d.py
+-------------------
+Stage 1: Convert raw LIDC-IDRI DICOM series → 3D nodule crops (.npy)
 
-Converts raw DICOM scans → labelled 3D .npy volumes + segmentation masks,
-with patient-level train/val/test splits (no data leakage).
+What this script does
+---------------------
+  1. Queries pylidc for all scans and serialises nodule metadata to plain
+     Python dicts (fixes multiprocessing pickle crash)
+  2. Loads each patient's DICOM volume — handles all known LIDC-IDRI folder
+     structures (flat, nested, extensionless)
+  3. Resamples to 1×1×1 mm isotropic spacing via scipy.ndimage.zoom
+     (fixes MONAI Spacing API incompatibility)
+  4. Extracts 64×64×64 nodule crops + binary segmentation masks
+  5. Saves under a patient-level directory structure ready for
+     patient-level train/test splitting
 
-All resampling uses MONAI transforms (Spacing) instead of scipy.ndimage.zoom.
-Scan-level extraction is fully parallelised via ProcessPoolExecutor.
-
-Steps:
-  1. Organise raw DICOMs into pylidc-compatible folder structure
-  2. Configure pylidc to locate the data
-  3. Patient-level split (70/15/15 by LIDC-IDRI-XXXX ID)
-  4. Parallel: for every scan → cluster annotations, build volume+mask,
-     MONAI Spacing resample to 1mm isotropic, extract 64³ crops, save
-
-Output layout:
+Output layout
+-------------
   <out_dir>/
-    patient_splits.json
     volumes/
-      <patient_id>/
-        <patient_id>_nodule_<i>_vol.npy      (64,64,64) float32 HU
-        <patient_id>_nodule_<i>_mask.npy     (64,64,64) bool
-        <patient_id>_nodule_<i>_meta.json    {malignancy, patient_id, ...}
+      LIDC-IDRI-0001/
+        Benign_0/
+          LIDC-IDRI-0001_nodule0_malig2.0_vol.npy    ← (64,64,64) HU crop
+          LIDC-IDRI-0001_nodule0_malig2.0_mask.npy   ← (64,64,64) bool mask
+        Malignant_1/
+          LIDC-IDRI-0001_nodule1_malig4.5_vol.npy
+          LIDC-IDRI-0001_nodule1_malig4.5_mask.npy
+      LIDC-IDRI-0002/
+        ...
+    dataset_summary.json    ← per-patient stats, class balance, spacing info
+    checkpoint.txt          ← processed patient IDs (resume support)
 
-Run:
-  python preprocessing.py --raw_dir /path/to/LIDC-IDRI \\
-                           --out_dir /path/to/processed_3d \\
-                           --num_workers 8
+Key fixes vs previous version
+------------------------------
+  ✓ Pickle fix      — all pylidc ORM objects serialised to dicts before
+                       passing to worker processes
+  ✓ Scipy resampling — replaces MONAI Spacing (affine API changed in MONAI>=1.3)
+  ✓ Robust DICOM loader — handles flat / nested / extensionless file structures
+  ✓ Malignancy label — ambiguous (avg==3.0) nodules are skipped
+  ✓ Min annotators  — nodules with <2 radiologist annotations are skipped
+  ✓ Resume support  — re-run safely after crash; already-done patients skipped
+  ✓ Error surfacing — first 5 errors printed in full, all errors logged to JSON
+
+Usage
+-----
+  python preprocessing_3d.py \
+      --raw_dir  /content/drive/MyDrive/LIDC-IDRI \
+      --out_dir  /content/drive/MyDrive/LIDC-3D-Processed \
+      --workers  4
+
+  # Resume after crash (same command — checkpoint.txt handles it)
+  python preprocessing_3d.py \
+      --raw_dir  /content/drive/MyDrive/LIDC-IDRI \
+      --out_dir  /content/drive/MyDrive/LIDC-3D-Processed \
+      --workers  4
 """
 
 import os
+import sys
 import json
-import shutil
 import argparse
 import configparser
-import importlib
 import multiprocessing as mp
-import time
 import traceback
-import warnings
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from functools import partial
+from glob import glob
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pydicom
 import pylidc as pl
+from scipy.ndimage import zoom as scipy_zoom
+from monai.transforms import SpatialCrop, ResizeWithPadOrCrop
 import torch
-from glob import glob
 
-# ── MONAI-native resampling ──
-from monai.transforms import Spacing, SpatialCrop, ResizeWithPadOrCrop
 
 # ──────────────────────────────────────────────
-#  Monkey-patches required by older pylidc
+#  Pylidc compatibility patches
+#  (required for pylidc < 0.2.3 on NumPy >= 1.24)
 # ──────────────────────────────────────────────
 np.int   = int
 np.float = float
@@ -67,576 +90,656 @@ configparser.SafeConfigParser = configparser.ConfigParser
 # ──────────────────────────────────────────────
 #  Constants
 # ──────────────────────────────────────────────
-
-CROP_SIZE       = 64                   # target 3D crop size per axis
-PAD_VOXELS      = 10                   # padding around nodule bbox
-TARGET_SPACING  = (1.0, 1.0, 1.0)     # isotropic 1mm³ voxels
-DEFAULT_WORKERS = max(1, mp.cpu_count() - 1)   # leave 1 core free
+CROP_SIZE       = 64                  # output voxels per axis
+TARGET_SPACING  = (1.0, 1.0, 1.0)    # mm — isotropic target
+MIN_ANNOTATORS  = 2                   # skip nodules with fewer radiologists
+IGNORE_DIRS     = {                   # preprocessing outputs — never scan these
+    "Benign_0", "Malignant_1", "volumes",
+    "processed_images", "checkpoints", "results",
+    "__pycache__", ".ipynb_checkpoints",
+}
 
 
 # ──────────────────────────────────────────────
-#  MONAI resampling wrappers
+#  Resampling  (scipy — no MONAI Spacing API issues)
 # ──────────────────────────────────────────────
 
-def _monai_resample_volume(
-    vol: np.ndarray,
-    original_spacing: Tuple[float, float, float],
-    target_spacing: Tuple[float, float, float] = TARGET_SPACING,
-) -> Tuple[np.ndarray, Tuple[float, float, float]]:
+def resample_volume(vol: np.ndarray, spacing: Tuple) -> np.ndarray:
     """
-    Resample a (H, W, D) volume to target spacing using MONAI Spacing.
+    Resample a float32 HU volume to 1×1×1 mm isotropic.
 
-    MONAI Spacing expects:
-      input  : (C, H, W, D) tensor with affine/pixdim metadata
-      pixdim : target spacing in each dimension
+    Parameters
+    ----------
+    vol     : (H, W, D) float32 HU array
+    spacing : (x_mm, y_mm, z_mm) original voxel size
 
     Returns
     -------
-    resampled : (H', W', D') float32 volume
-    scale     : (sy, sx, sz) scale factors applied
+    (H', W', D') float32 resampled array
     """
-    # Add channel dim: (1, H, W, D)
-    tensor = torch.from_numpy(vol.astype(np.float32)).unsqueeze(0)
+    sx, sy, sz = spacing
+    tx, ty, tz = TARGET_SPACING
 
-    resampler = Spacing(
-        pixdim=target_spacing,
-        mode="bilinear",        # smooth interpolation for HU data
-        padding_mode="border",  # replicate edge values
-    )
+    # zoom_factors must match (H, W, D) axis order
+    zoom_factors = (sy / ty, sx / tx, sz / tz)
 
-    # Spacing needs the source pixdim via affine or explicit pixdim arg.
-    # We pass src_affine as a simple diagonal.
-    src_affine = np.diag([*original_spacing, 1.0]).astype(np.float64)
-    resampled = resampler(tensor, affine=src_affine)
-
-    # resampled is a MetaTensor (C, H', W', D')
-    out = resampled.squeeze(0).numpy()
-
-    scale = tuple(o / t for o, t in zip(original_spacing, target_spacing))
-    return out, scale
+    return scipy_zoom(
+        vol.astype(np.float32),
+        zoom=zoom_factors,
+        order=1,          # bilinear interpolation for continuous HU values
+        prefilter=False,  # skip Gaussian pre-smoothing for speed
+    ).astype(np.float32)
 
 
-def _monai_resample_mask(
-    mask: np.ndarray,
-    original_spacing: Tuple[float, float, float],
-    target_spacing: Tuple[float, float, float] = TARGET_SPACING,
-) -> np.ndarray:
+def resample_mask(mask: np.ndarray, spacing: Tuple) -> np.ndarray:
     """
-    Resample a binary mask using MONAI Spacing (nearest-neighbour).
+    Resample a binary segmentation mask to 1×1×1 mm.
+    Uses nearest-neighbour (order=0) to preserve binary values.
     """
-    tensor = torch.from_numpy(mask.astype(np.float32)).unsqueeze(0)
+    sx, sy, sz = spacing
+    tx, ty, tz = TARGET_SPACING
+    zoom_factors = (sy / ty, sx / tx, sz / tz)
 
-    resampler = Spacing(
-        pixdim=target_spacing,
-        mode="nearest",         # preserve binary values
-        padding_mode="zeros",
-    )
-
-    src_affine = np.diag([*original_spacing, 1.0]).astype(np.float64)
-    resampled = resampler(tensor, affine=src_affine)
-
-    return (resampled.squeeze(0).numpy() > 0.5).astype(np.bool_)
+    return scipy_zoom(
+        mask.astype(np.float32),
+        zoom=zoom_factors,
+        order=0,          # nearest-neighbour — critical for binary masks
+        prefilter=False,
+    ) > 0.5
 
 
-def _monai_crop_and_pad(
-    vol: np.ndarray,
-    center: Tuple[int, int, int],
-    crop_size: int = CROP_SIZE,
-) -> Tuple[np.ndarray, Tuple[int, int, int]]:
+# ──────────────────────────────────────────────
+#  3-D crop  (MONAI SpatialCrop + ResizeWithPadOrCrop)
+# ──────────────────────────────────────────────
+
+def crop_3d(vol: np.ndarray, center: np.ndarray) -> np.ndarray:
     """
-    Extract a centred 3D crop using MONAI transforms.
+    Extract a CROP_SIZE³ region centred on `center` from `vol`.
+    Uses ResizeWithPadOrCrop to guarantee exact output size even when
+    the centre is near the volume boundary.
 
-    Uses SpatialCrop for extraction and ResizeWithPadOrCrop to guarantee
-    the output is exactly (crop_size, crop_size, crop_size).
+    Parameters
+    ----------
+    vol    : (H, W, D) float32 numpy array
+    center : (3,) int array  [y, x, z]
 
-    Returns (crop, start_coords).
+    Returns
+    -------
+    (CROP_SIZE, CROP_SIZE, CROP_SIZE) float32 array
     """
-    half = crop_size // 2
-    # Compute ROI start/end
+    half   = CROP_SIZE // 2
     starts = [max(0, int(c) - half) for c in center]
-    ends   = [min(vol.shape[d], starts[d] + crop_size) for d in range(3)]
-    # Re-adjust starts if we hit the edge
-    starts = [max(0, ends[d] - crop_size) for d in range(3)]
+    ends   = [min(vol.shape[i], starts[i] + CROP_SIZE) for i in range(3)]
+    # Re-anchor start if end hit boundary
+    starts = [max(0, ends[i] - CROP_SIZE) for i in range(3)]
 
-    # Add channel dim for MONAI: (1, H, W, D)
-    tensor = torch.from_numpy(vol.astype(np.float32)).unsqueeze(0)
+    tensor  = torch.from_numpy(vol).unsqueeze(0)   # (1, H, W, D)
+    cropped = SpatialCrop(roi_start=starts, roi_end=ends)(tensor)
+    padded  = ResizeWithPadOrCrop(
+        (CROP_SIZE, CROP_SIZE, CROP_SIZE)
+    )(cropped)
 
-    cropper = SpatialCrop(roi_start=starts, roi_end=ends)
-    cropped = cropper(tensor)
-
-    # Guarantee exact size via pad-or-crop
-    padder = ResizeWithPadOrCrop(spatial_size=(crop_size, crop_size, crop_size))
-    result = padder(cropped)
-
-    return result.squeeze(0).numpy(), tuple(starts)
+    return padded.squeeze(0).numpy()
 
 
 # ──────────────────────────────────────────────
-#  Helpers
+#  DICOM loader  (handles all LIDC-IDRI structures)
 # ──────────────────────────────────────────────
 
-def organise_dicom_folders(raw_dir: str) -> None:
+def load_volume(
+    patient_id: str,
+    series_uid: str,
+    root: str,
+) -> Tuple[np.ndarray, Tuple]:
     """
-    Move unorganised DICOM series folders under their PatientID parent so
-    pylidc can resolve paths ( root/<PatientID>/<SeriesUID>/*.dcm ).
+    Load a DICOM CT series and return a (H, W, D) HU volume + spacing.
+
+    Handles three known LIDC-IDRI folder structures:
+      A  root/PatientID/SeriesUID/*.dcm            (TCIA direct download)
+      B  root/PatientID/StudyUID/SeriesUID/*.dcm   (TCIA nested)
+      C  root/PatientID/**/*.dcm                   (any depth, filter by UID tag)
+
+    Returns
+    -------
+    vol     : (H, W, D) float32 HU array, sorted inferior→superior
+    spacing : (x_mm, y_mm, z_mm) tuple of physical voxel size
     """
-    skip = {"Benign_0", "Malignant_1", "processed_images", "processed_3d"}
-    orphans = [
-        d for d in os.listdir(raw_dir)
-        if os.path.isdir(os.path.join(raw_dir, d))
-        and not d.startswith("LIDC-IDRI")
-        and d not in skip
-    ]
-    print(f"Found {len(orphans)} orphan folders to reorganise …")
 
-    moved, failed = 0, 0
-    for folder in orphans:
-        folder_path = os.path.join(raw_dir, folder)
-        dcm_files   = glob(os.path.join(folder_path, "**/*.dcm"), recursive=True)
-        if not dcm_files:
-            continue
-        try:
-            ds         = pydicom.dcmread(dcm_files[0], stop_before_pixels=True)
-            patient_id = str(ds.PatientID).strip()
-            dest       = os.path.join(raw_dir, patient_id)
-            os.makedirs(dest, exist_ok=True)
-            shutil.move(folder_path, dest)
-            moved += 1
-        except Exception as e:
-            print(f"  Failed {folder[:40]}: {e}")
-            failed += 1
+    # ── Structure A: direct ───────────────────
+    direct_path = os.path.join(root, patient_id, series_uid)
+    files = sorted(glob(os.path.join(direct_path, "*.dcm")))
 
-    print(f"Done: {moved} moved, {failed} failed.\n")
+    # ── Structure B: one extra nesting level ──
+    if not files:
+        files = sorted(glob(
+            os.path.join(root, patient_id, "*", series_uid, "*.dcm")
+        ))
 
+    # ── Structure C: recursive + UID tag filter ──
+    if not files:
+        all_dcms = sorted(glob(
+            os.path.join(root, patient_id, "**", "*.dcm"),
+            recursive=True,
+        ))
 
-def configure_pylidc(raw_dir: str) -> None:
-    """Write ~/.pylidcrc so pylidc can find the database."""
-    config = configparser.ConfigParser()
-    config["DEFAULT"] = {"path": raw_dir}
-    rc_path = os.path.expanduser("~/.pylidcrc")
-    with open(rc_path, "w") as f:
-        config.write(f)
-    print(f"pylidcrc written → {rc_path}  (path = {raw_dir})")
+        # Some LIDC-IDRI files have no extension
+        if not all_dcms:
+            for dirpath, dirnames, fnames in os.walk(
+                os.path.join(root, patient_id)
+            ):
+                dirnames[:] = [d for d in dirnames if d not in IGNORE_DIRS]
+                for fname in fnames:
+                    if "." not in fname:
+                        all_dcms.append(os.path.join(dirpath, fname))
 
+        # Filter to correct series by tag
+        if all_dcms:
+            matched_dir = None
+            for f in all_dcms[:10]:
+                try:
+                    ds = pydicom.dcmread(f, stop_before_pixels=True)
+                    if str(getattr(ds, "SeriesInstanceUID", "")) == series_uid:
+                        matched_dir = os.path.dirname(f)
+                        break
+                except Exception:
+                    continue
 
-def load_volume_directly(scan, root: str) -> Tuple[np.ndarray, Tuple]:
-    """
-    Bypass pylidc's internal path resolution and build a (H, W, Z) HU volume
-    directly from DICOMs on disk.  Returns (volume, (row_sp, col_sp, slice_sp)).
-    """
-    series_path = os.path.join(root, scan.patient_id, scan.series_instance_uid)
-    dcm_files   = sorted(glob(os.path.join(series_path, "*.dcm")))
+            if matched_dir:
+                files = sorted([
+                    f for f in all_dcms
+                    if os.path.dirname(f) == matched_dir
+                ])
+            else:
+                # Last resort — use all DICOMs found under patient folder
+                files = all_dcms
 
-    if not dcm_files:
-        raise FileNotFoundError(f"No DICOMs found in {series_path}")
-
-    slices = []
-    pixel_spacings = []
-    slice_positions = []
-
-    for f in dcm_files:
-        ds        = pydicom.dcmread(f)
-        img       = ds.pixel_array.astype(np.float32)
-        slope     = float(getattr(ds, "RescaleSlope",     1))
-        intercept = float(getattr(ds, "RescaleIntercept", 0))
-        hu_slice  = img * slope + intercept
-
-        ps = getattr(ds, "PixelSpacing", [1.0, 1.0])
-        pixel_spacings.append((float(ps[0]), float(ps[1])))
-
-        try:
-            z = float(ds.ImagePositionPatient[2])
-        except (AttributeError, IndexError):
-            z = float(getattr(ds, "InstanceNumber", len(slices)))
-        slice_positions.append(z)
-
-        slices.append((z, hu_slice))
-
-    slices.sort(key=lambda x: x[0])
-    vol = np.stack([s[1] for s in slices], axis=-1)  # (H, W, Z)
-
-    ps = pixel_spacings[0]
-    sorted_z = sorted(slice_positions)
-    if len(sorted_z) > 1:
-        slice_thickness = float(np.median(np.diff(sorted_z)))
-    else:
-        slice_thickness = float(getattr(pydicom.dcmread(dcm_files[0]),
-                                         "SliceThickness", 1.0))
-
-    original_spacing = (ps[0], ps[1], abs(slice_thickness))
-    return vol, original_spacing
-
-
-def build_union_mask(nodule_annotations, vol_shape) -> np.ndarray:
-    """
-    Build a union segmentation mask from all annotations for a nodule.
-    Each annotation's boolean_mask() is placed at its bbox position,
-    then all are OR-combined.
-    """
-    union_mask = np.zeros(vol_shape, dtype=np.bool_)
-
-    for ann in nodule_annotations:
-        try:
-            bbox   = ann.bbox()
-            mask_3d = ann.boolean_mask()
-
-            if mask_3d.sum() == 0:
-                continue
-
-            y_s, y_e = bbox[0].start, min(bbox[0].start + mask_3d.shape[0], vol_shape[0])
-            x_s, x_e = bbox[1].start, min(bbox[1].start + mask_3d.shape[1], vol_shape[1])
-            z_s, z_e = bbox[2].start, min(bbox[2].start + mask_3d.shape[2], vol_shape[2])
-
-            my, mx, mz = y_e - y_s, x_e - x_s, z_e - z_s
-            union_mask[y_s:y_e, x_s:x_e, z_s:z_e] |= mask_3d[:my, :mx, :mz]
-
-        except Exception as e:
-            # Silently skip bad annotations in workers
-            continue
-
-    return union_mask
-
-
-# ──────────────────────────────────────────────
-#  Patient-level split
-# ──────────────────────────────────────────────
-
-def build_patient_splits(scans, out_dir: str,
-                         train_ratio: float = 0.70,
-                         val_ratio: float = 0.15,
-                         seed: int = 42) -> dict:
-    """
-    Split patients (not patches) into train/val/test sets.
-    Returns dict: {"train": [ids], "val": [ids], "test": [ids]}
-    """
-    splits_path = os.path.join(out_dir, "patient_splits.json")
-
-    if os.path.exists(splits_path):
-        with open(splits_path) as f:
-            splits = json.load(f)
-        print(f"Loaded existing patient splits from {splits_path}")
-        print(f"  Train: {len(splits['train'])} | "
-              f"Val: {len(splits['val'])} | "
-              f"Test: {len(splits['test'])}")
-        return splits
-
-    patient_ids = sorted(set(scan.patient_id for scan in scans))
-    n = len(patient_ids)
-    print(f"Total unique patients: {n}")
-
-    rng = np.random.RandomState(seed)
-    rng.shuffle(patient_ids)
-
-    train_n = int(train_ratio * n)
-    val_n   = int(val_ratio * n)
-
-    splits = {
-        "train": patient_ids[:train_n],
-        "val":   patient_ids[train_n:train_n + val_n],
-        "test":  patient_ids[train_n + val_n:],
-    }
-
-    os.makedirs(out_dir, exist_ok=True)
-    with open(splits_path, "w") as f:
-        json.dump(splits, f, indent=2)
-
-    print(f"Patient splits saved → {splits_path}")
-    print(f"  Train: {len(splits['train'])} | "
-          f"Val: {len(splits['val'])} | "
-          f"Test: {len(splits['test'])}")
-    return splits
-
-
-# ──────────────────────────────────────────────
-#  Single-scan worker function (runs in parallel)
-# ──────────────────────────────────────────────
-
-def _process_single_scan(
-    scan_patient_id: str,
-    scan_series_uid: str,
-    raw_dir: str,
-    out_dir: str,
-    patient_to_split: Dict[str, str],
-    min_annotators: int,
-) -> Dict:
-    """
-    Process one scan: load DICOM → MONAI resample → extract crops → save.
-
-    Designed to run inside a ProcessPoolExecutor worker.
-    Returns a stats dict with counts of saved / skipped nodules.
-    """
-    # Re-import inside worker (fork safety)
-    import configparser
-    configparser.SafeConfigParser = configparser.ConfigParser
-    np.int   = int
-    np.float = float
-    np.bool  = bool
-
-    import pylidc as pl
-
-    volumes_dir = os.path.join(out_dir, "volumes")
-    stats = {"saved": 0, "skipped": 0, "benign": 0, "malignant": 0,
-             "patient_id": scan_patient_id, "error": None}
-
-    try:
-        # Re-query this specific scan (each worker gets its own DB session)
-        scans = pl.query(pl.Scan).filter(
-            pl.Scan.patient_id == scan_patient_id,
-            pl.Scan.series_instance_uid == scan_series_uid,
-        ).all()
-
-        if not scans:
-            stats["error"] = "Scan not found in DB"
-            return stats
-
-        scan = scans[0]
-        nodules = scan.cluster_annotations()
-        if not nodules:
-            return stats
-
-        # Load full volume with spacing info
-        vol, original_spacing = load_volume_directly(scan, raw_dir)
-
-        # ── MONAI Spacing resample to isotropic 1mm³ ──
-        vol_resampled, scale_factors = _monai_resample_volume(
-            vol, original_spacing, TARGET_SPACING
+    if not files:
+        raise FileNotFoundError(
+            f"No DICOM files found for {patient_id} / ...{series_uid[-20:]}. "
+            f"Searched under: {os.path.join(root, patient_id)}"
         )
 
-        patient_dir = os.path.join(volumes_dir, scan.patient_id)
-        os.makedirs(patient_dir, exist_ok=True)
+    # ── Decode slices + convert to HU ─────────
+    slices: List[Tuple[float, np.ndarray]] = []
+    z_positions: List[float] = []
 
+    for f in files:
+        try:
+            ds  = pydicom.dcmread(f)
+            img = ds.pixel_array.astype(np.float32)
+            hu  = (img
+                   * float(getattr(ds, "RescaleSlope",     1))
+                   + float(getattr(ds, "RescaleIntercept", 0)))
+
+            # Prefer ImagePositionPatient z; fall back to InstanceNumber
+            if hasattr(ds, "ImagePositionPatient"):
+                z = float(ds.ImagePositionPatient[2])
+            else:
+                z = float(getattr(ds, "InstanceNumber", len(slices)))
+
+            slices.append((z, hu))
+            z_positions.append(z)
+        except Exception:
+            continue  # skip unreadable / non-image DICOM files
+
+    if not slices:
+        raise ValueError(
+            f"Could not decode any DICOM slices for {patient_id}. "
+            f"Files found: {len(files)}"
+        )
+
+    # Sort inferior → superior
+    slices.sort(key=lambda t: t[0])
+    vol = np.stack([s[1] for s in slices], axis=-1)   # (H, W, D)
+
+    # ── Compute physical spacing ───────────────
+    sorted_z = sorted(z_positions)
+    if len(sorted_z) > 1:
+        diffs     = np.abs(np.diff(sorted_z))
+        z_spacing = float(np.median(diffs[diffs > 0])) if np.any(diffs > 0) else 1.0
+    else:
+        z_spacing = 1.0
+
+    xy_spacing = (1.0, 1.0)
+    for f in files[:5]:
+        try:
+            ds = pydicom.dcmread(f, stop_before_pixels=True)
+            ps = getattr(ds, "PixelSpacing", None)
+            if ps and len(ps) >= 2:
+                xy_spacing = (float(ps[0]), float(ps[1]))
+                break
+        except Exception:
+            continue
+
+    spacing = (*xy_spacing, z_spacing)   # (x_mm, y_mm, z_mm)
+    return vol, spacing
+
+
+# ──────────────────────────────────────────────
+#  Segmentation mask builder  (plain dicts — no ORM)
+# ──────────────────────────────────────────────
+
+def build_mask_from_dict(
+    annotations: List[Dict],
+    vol_shape: Tuple,
+) -> np.ndarray:
+    """
+    Reconstruct a 3D binary mask from serialised annotation dicts.
+    Takes the union of all radiologist masks (consensus).
+
+    Parameters
+    ----------
+    annotations : list of dicts with keys "bbox" and "mask"
+    vol_shape   : (H, W, D) shape of the full unresampled volume
+
+    Returns
+    -------
+    (H, W, D) bool array
+    """
+    mask = np.zeros(vol_shape, dtype=np.bool_)
+
+    for ann in annotations:
+        (y0, y1), (x0, x1), (z0, z1) = ann["bbox"]
+        m = ann["mask"]   # (mH, mW, mD) bool
+
+        # Clip destination region to volume bounds
+        y1c = min(y0 + m.shape[0], vol_shape[0])
+        x1c = min(x0 + m.shape[1], vol_shape[1])
+        z1c = min(z0 + m.shape[2], vol_shape[2])
+
+        mask[y0:y1c, x0:x1c, z0:z1c] |= m[
+            : y1c - y0,
+            : x1c - x0,
+            : z1c - z0,
+        ]
+
+    return mask
+
+
+# ──────────────────────────────────────────────
+#  Metadata preparation  (main process only)
+# ──────────────────────────────────────────────
+
+def prepare_metadata(
+    scans: List,
+    checkpoint_ids: set,
+) -> List[Dict]:
+    """
+    Iterate every pylidc Scan, cluster annotations, and serialise
+    all nodule data to plain Python dicts safe for multiprocessing.
+
+    This must run in the MAIN process where pylidc SQLAlchemy is live.
+    Workers receive only serialisable primitives (dicts + numpy arrays).
+
+    Parameters
+    ----------
+    scans          : list of pylidc.Scan objects
+    checkpoint_ids : patient IDs already processed (resume support)
+
+    Returns
+    -------
+    List of patient dicts ready to pass to worker()
+    """
+    prepared      = []
+    total_nodules = 0
+
+    print(f"Preparing metadata for {len(scans)} scans...")
+    print("(Warnings about >4 annotations are normal — pylidc handles them)\n")
+
+    for i, scan in enumerate(scans):
+
+        pid = scan.patient_id
+
+        # Resume: skip already-processed patients
+        if pid in checkpoint_ids:
+            continue
+
+        try:
+            nodule_groups = scan.cluster_annotations()
+        except Exception as e:
+            print(f"  [WARN] cluster_annotations failed for {pid}: {e}")
+            continue
+
+        if not nodule_groups:
+            continue
+
+        serialised_nodules = []
+
+        for nodule in nodule_groups:
+
+            # Skip under-annotated nodules
+            if len(nodule) < MIN_ANNOTATORS:
+                continue
+
+            annotations    = []
+            mal_scores     = []
+
+            for ann in nodule:
+                try:
+                    bbox = ann.bbox()
+                    mask = ann.boolean_mask()  # (mH, mW, mD) bool
+                    mal_scores.append(int(ann.malignancy))
+
+                    annotations.append({
+                        # Store bbox as plain int pairs — slice objects not picklable
+                        "bbox": [
+                            [int(bbox[0].start), int(bbox[0].stop)],
+                            [int(bbox[1].start), int(bbox[1].stop)],
+                            [int(bbox[2].start), int(bbox[2].stop)],
+                        ],
+                        "mask": mask.astype(np.bool_),  # numpy array — picklable
+                    })
+                except Exception:
+                    continue
+
+            if not annotations or not mal_scores:
+                continue
+
+            avg_malignancy = sum(mal_scores) / len(mal_scores)
+
+            # Skip ambiguous nodules (radiologists evenly split 3.0)
+            if avg_malignancy == 3.0:
+                continue
+
+            serialised_nodules.append({
+                "annotations":     annotations,
+                "avg_malignancy":  round(avg_malignancy, 2),
+                "is_malignant":    avg_malignancy > 3.0,
+                "n_annotators":    len(nodule),
+            })
+
+        if not serialised_nodules:
+            continue
+
+        prepared.append({
+            "patient_id": pid,
+            "series_uid": scan.series_instance_uid,
+            "nodules":    serialised_nodules,
+        })
+        total_nodules += len(serialised_nodules)
+
+        if (i + 1) % 100 == 0:
+            print(
+                f"  {i+1}/{len(scans)} scans | "
+                f"{len(prepared)} with nodules | "
+                f"{total_nodules} nodules serialised"
+            )
+
+    print(
+        f"\nReady: {len(prepared)} patients | "
+        f"{total_nodules} nodules to process\n"
+    )
+    return prepared
+
+
+# ──────────────────────────────────────────────
+#  Worker  (runs in subprocess — no pylidc)
+# ──────────────────────────────────────────────
+
+def worker(item: Dict, raw_dir: str, out_dir: str) -> Dict:
+    """
+    Process one patient: load DICOM → resample → extract crops → save.
+
+    Receives only plain-Python/numpy data — no SQLAlchemy objects.
+    All exceptions are caught and returned in the result dict so the
+    main process can log them without crashing the pool.
+    """
+    pid     = item["patient_id"]
+    uid     = item["series_uid"]
+    nodules = item["nodules"]
+
+    result = {
+        "patient_id": pid,
+        "saved":      0,
+        "skipped":    0,
+        "error":      None,
+        "spacing":    None,
+        "vol_shape":  None,
+    }
+
+    try:
+        # ── 1. Load DICOM volume ──────────────────────────────
+        vol, spacing = load_volume(pid, uid, raw_dir)
+        result["spacing"]   = spacing
+        result["vol_shape"] = vol.shape
+
+        # ── 2. Resample full volume to isotropic spacing ──────
+        vol_resampled = resample_volume(vol, spacing)
+
+        # ── 3. Process each nodule ────────────────────────────
         for i, nodule in enumerate(nodules):
 
-            if len(nodule) < min_annotators:
-                stats["skipped"] += 1
+            annotations    = nodule["annotations"]
+            is_malignant   = nodule["is_malignant"]
+            avg_malignancy = nodule["avg_malignancy"]
+
+            # Build union mask in ORIGINAL voxel space
+            mask_orig = build_mask_from_dict(annotations, vol.shape)
+            if mask_orig.sum() == 0:
+                result["skipped"] += 1
                 continue
 
-            scores = [ann.malignancy for ann in nodule]
-            avg_malignancy = sum(scores) / len(scores)
+            # Resample mask to isotropic space
+            mask_resampled = resample_mask(mask_orig, spacing)
 
-            if avg_malignancy == 3.0:
-                stats["skipped"] += 1
-                continue
-
-            is_malignant = avg_malignancy > 3.0
-
-            # Build union segmentation mask in original space
-            union_mask_orig = build_union_mask(nodule, vol.shape)
-
-            if union_mask_orig.sum() == 0:
-                stats["skipped"] += 1
-                continue
-
-            # ── MONAI Spacing resample mask (nearest) ──
-            union_mask = _monai_resample_mask(
-                union_mask_orig, original_spacing, TARGET_SPACING
-            )
-
-            # Align shapes (MONAI can differ by ±1 voxel)
-            min_shape = tuple(
-                min(v, m) for v, m in
-                zip(vol_resampled.shape, union_mask.shape)
-            )
-            vol_aligned  = vol_resampled[:min_shape[0], :min_shape[1], :min_shape[2]]
-            mask_aligned = union_mask[:min_shape[0], :min_shape[1], :min_shape[2]]
-
-            # Find nodule centroid in resampled space
-            coords = np.argwhere(mask_aligned)
+            # Find nodule centre in resampled space
+            coords = np.argwhere(mask_resampled)
             if len(coords) == 0:
-                stats["skipped"] += 1
+                result["skipped"] += 1
                 continue
-            centroid = tuple(coords.mean(axis=0).astype(int))
 
-            # ── MONAI SpatialCrop + ResizeWithPadOrCrop ──
-            vol_crop, crop_start = _monai_crop_and_pad(
-                vol_aligned, centroid, CROP_SIZE
-            )
-            mask_crop, _ = _monai_crop_and_pad(
-                mask_aligned.astype(np.float32), centroid, CROP_SIZE
-            )
-            mask_crop = mask_crop > 0.5
+            center = coords.mean(axis=0).astype(int)   # [y, x, z]
 
-            # Save files
-            prefix = f"{scan.patient_id}_nodule_{i}"
-            np.save(os.path.join(patient_dir, f"{prefix}_vol.npy"),
-                    vol_crop.astype(np.float32))
-            np.save(os.path.join(patient_dir, f"{prefix}_mask.npy"),
-                    mask_crop.astype(np.bool_))
+            # ── 4. Extract 64³ crops ──────────────────────────
+            vol_crop  = crop_3d(vol_resampled,                       center)
+            mask_crop = crop_3d(mask_resampled.astype(np.float32),   center) > 0.5
 
-            split = patient_to_split.get(scan.patient_id, "unknown")
-            meta = {
-                "patient_id":        scan.patient_id,
-                "nodule_index":      i,
-                "malignancy_scores": scores,
-                "avg_malignancy":    avg_malignancy,
-                "is_malignant":      is_malignant,
-                "label":             int(is_malignant),
-                "split":             split,
-                "crop_size":         CROP_SIZE,
-                "original_spacing":  list(original_spacing),
-                "target_spacing":    list(TARGET_SPACING),
-                "centroid_resampled": list(centroid),
-                "crop_start":        list(crop_start),
-                "mask_voxels":       int(mask_crop.sum()),
-                "n_annotators":      len(nodule),
-                "resampler":         "monai.transforms.Spacing",
-            }
-            with open(os.path.join(patient_dir, f"{prefix}_meta.json"), "w") as f:
-                json.dump(meta, f, indent=2)
+            # ── 5. Save ───────────────────────────────────────
+            label     = "Malignant_1" if is_malignant else "Benign_0"
+            prefix    = f"{pid}_nodule{i}_malig{avg_malignancy:.1f}"
+            label_dir = os.path.join(out_dir, "volumes", pid, label)
+            os.makedirs(label_dir, exist_ok=True)
 
-            stats["saved"] += 1
-            if is_malignant:
-                stats["malignant"] += 1
-            else:
-                stats["benign"] += 1
+            np.save(os.path.join(label_dir, f"{prefix}_vol.npy"),  vol_crop)
+            np.save(os.path.join(label_dir, f"{prefix}_mask.npy"), mask_crop.astype(np.bool_))
+
+            result["saved"] += 1
 
     except Exception as e:
-        stats["error"] = f"{type(e).__name__}: {e}"
+        result["error"] = f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
 
-    return stats
+    return result
 
 
-def _checkpoint(path: str, patient_id: str) -> None:
-    """Append patient_id to checkpoint file (thread-safe via append mode)."""
+# ──────────────────────────────────────────────
+#  Checkpoint helpers
+# ──────────────────────────────────────────────
+
+def load_checkpoint(out_dir: str) -> set:
+    path = os.path.join(out_dir, "checkpoint.txt")
+    if not os.path.exists(path):
+        return set()
+    with open(path) as f:
+        ids = {line.strip() for line in f if line.strip()}
+    print(f"Resuming — {len(ids)} patients already done (loaded from checkpoint.txt)")
+    return ids
+
+
+def save_checkpoint(out_dir: str, patient_id: str):
+    path = os.path.join(out_dir, "checkpoint.txt")
     with open(path, "a") as f:
         f.write(patient_id + "\n")
 
 
 # ──────────────────────────────────────────────
-#  Main extraction pipeline (parallelised)
+#  Summary + class balance report
 # ──────────────────────────────────────────────
 
-def extract_3d_nodule_volumes(
-    raw_dir: str,
-    out_dir: str,
-    min_annotators: int = 2,
-    num_workers: int = DEFAULT_WORKERS,
-) -> None:
-    """
-    Extract 3D nodule volumes and segmentation masks from every scan,
-    running up to `num_workers` scans in parallel.
+def print_class_balance(out_dir: str):
+    """Walk output tree and count Benign_0 / Malignant_1 crops."""
+    benign    = 0
+    malignant = 0
+    volumes_dir = os.path.join(out_dir, "volumes")
 
-    Uses ProcessPoolExecutor for CPU-bound DICOM loading + MONAI resampling.
-    """
-    volumes_dir     = os.path.join(out_dir, "volumes")
-    checkpoint_file = os.path.join(out_dir, "processed_scans_3d_checkpoint.txt")
+    for pid in os.listdir(volumes_dir):
+        pid_path = os.path.join(volumes_dir, pid)
+        if not os.path.isdir(pid_path):
+            continue
+        for label in ["Benign_0", "Malignant_1"]:
+            label_path = os.path.join(pid_path, label)
+            if not os.path.isdir(label_path):
+                continue
+            count = len([
+                f for f in os.listdir(label_path)
+                if f.endswith("_vol.npy")
+            ])
+            if label == "Benign_0":
+                benign    += count
+            else:
+                malignant += count
 
-    os.makedirs(volumes_dir, exist_ok=True)
-
-    # Resume support
-    if os.path.exists(checkpoint_file):
-        with open(checkpoint_file) as f:
-            processed_ids = set(f.read().splitlines())
-        print(f"Resuming: {len(processed_ids)} scans already processed.")
-    else:
-        processed_ids = set()
-        print("Starting fresh.")
-
-    importlib.reload(pl)
-    scans = pl.query(pl.Scan).all()
-    print(f"Total scans found: {len(scans)}")
-
-    # Build patient-level splits
-    splits = build_patient_splits(scans, out_dir)
-    patient_to_split = {}
-    for split_name, ids in splits.items():
-        for pid in ids:
-            patient_to_split[pid] = split_name
-
-    # Filter to unprocessed scans
-    work_items = [
-        (scan.patient_id, scan.series_instance_uid)
-        for scan in scans
-        if scan.patient_id not in processed_ids
-    ]
-    print(f"Scans to process: {len(work_items)} (skipping {len(processed_ids)} done)")
-    print(f"Workers: {num_workers}\n")
-
-    if not work_items:
-        print("Nothing to do — all scans already processed.")
+    total = benign + malignant
+    if total == 0:
+        print("No crops found.")
         return
 
-    # ── Parallel extraction ───────────────────
-    t0 = time.perf_counter()
-    total_saved   = 0
+    print("\n" + "=" * 45)
+    print("  Dataset class balance")
+    print("=" * 45)
+    print(f"  Benign    : {benign:5d}  ({100*benign/total:.1f}%)")
+    print(f"  Malignant : {malignant:5d}  ({100*malignant/total:.1f}%)")
+    print(f"  Total     : {total:5d}")
+    if malignant > 0:
+        print(f"  Ratio     : {benign/malignant:.2f} : 1  (benign:malignant)")
+    print("=" * 45)
+
+
+def write_summary(out_dir: str, all_results: List[Dict]):
+    """Write per-patient stats to dataset_summary.json."""
+    summary = {
+        "total_patients":   len(all_results),
+        "total_saved":      sum(r["saved"]   for r in all_results),
+        "total_skipped":    sum(r["skipped"] for r in all_results),
+        "total_errors":     sum(1 for r in all_results if r["error"]),
+        "patients":         [
+            {
+                "patient_id": r["patient_id"],
+                "saved":      r["saved"],
+                "skipped":    r["skipped"],
+                "spacing":    r["spacing"],
+                "vol_shape":  r["vol_shape"],
+                "error":      r["error"] is not None,
+            }
+            for r in all_results
+        ],
+    }
+    path = os.path.join(out_dir, "dataset_summary.json")
+    with open(path, "w") as f:
+        json.dump(summary, f, indent=2)
+    print(f"\n  Summary saved → {path}")
+
+
+# ──────────────────────────────────────────────
+#  Main pipeline
+# ──────────────────────────────────────────────
+
+def run(raw_dir: str, out_dir: str, num_workers: int):
+    os.makedirs(out_dir, exist_ok=True)
+
+    # Load resume checkpoint
+    checkpoint_ids = load_checkpoint(out_dir)
+
+    # Query pylidc — must happen in main process
+    print("Querying pylidc database...")
+    scans = pl.query(pl.Scan).all()
+    print(f"Found {len(scans)} scans in database\n")
+
+    # Serialise all pylidc data to plain dicts (main process, SQLAlchemy live)
+    prepared = prepare_metadata(scans, checkpoint_ids)
+
+    if not prepared:
+        print("Nothing to process — all patients already in checkpoint.")
+        print_class_balance(out_dir)
+        return
+
+    print(f"Launching {num_workers} worker processes...\n")
+
+    all_results  = []
+    total_saved  = 0
     total_skipped = 0
-    errors        = []
-    split_stats   = defaultdict(lambda: {"benign": 0, "malignant": 0})
+    errors       = 0
+    error_log    = []
 
-    with ProcessPoolExecutor(max_workers=num_workers) as executor:
-        futures = {}
-        for pid, suid in work_items:
-            future = executor.submit(
-                _process_single_scan,
-                scan_patient_id=pid,
-                scan_series_uid=suid,
-                raw_dir=raw_dir,
-                out_dir=out_dir,
-                patient_to_split=patient_to_split,
-                min_annotators=min_annotators,
-            )
-            futures[future] = pid
+    with ProcessPoolExecutor(max_workers=num_workers) as pool:
 
-        done_count = 0
-        for future in as_completed(futures):
+        futures = {
+            pool.submit(worker, item, raw_dir, out_dir): item["patient_id"]
+            for item in prepared
+        }
+
+        for i, future in enumerate(as_completed(futures)):
             pid = futures[future]
-            done_count += 1
 
             try:
-                stats = future.result(timeout=600)  # 10 min timeout per scan
+                result = future.result()
             except Exception as e:
-                errors.append(f"{pid}: {e}")
-                _checkpoint(checkpoint_file, pid)
-                continue
+                result = {
+                    "patient_id": pid,
+                    "saved":      0,
+                    "skipped":    0,
+                    "error":      f"Future crashed: {e}\n{traceback.format_exc()}",
+                    "spacing":    None,
+                    "vol_shape":  None,
+                }
 
-            if stats["error"]:
-                errors.append(f"{pid}: {stats['error']}")
+            all_results.append(result)
+
+            if result["error"]:
+                errors += 1
+                error_log.append({
+                    "patient_id": pid,
+                    "error":      result["error"],
+                })
+                # Print first 5 errors in full so you can see what's wrong
+                if errors <= 5:
+                    print(f"\n[ERROR #{errors} — {pid}]")
+                    print(result["error"])
+                    print()
             else:
-                total_saved   += stats["saved"]
-                total_skipped += stats["skipped"]
-                split = patient_to_split.get(pid, "unknown")
-                split_stats[split]["benign"]    += stats["benign"]
-                split_stats[split]["malignant"] += stats["malignant"]
+                total_saved   += result["saved"]
+                total_skipped += result["skipped"]
+                # Mark patient as done in checkpoint
+                save_checkpoint(out_dir, pid)
 
-            _checkpoint(checkpoint_file, pid)
-
-            # Progress update every 25 scans
-            if done_count % 25 == 0 or done_count == len(work_items):
-                elapsed = time.perf_counter() - t0
-                rate = done_count / elapsed if elapsed > 0 else 0
-                eta = (len(work_items) - done_count) / rate if rate > 0 else 0
+            # Progress report every 25 patients
+            if (i + 1) % 25 == 0 or (i + 1) == len(prepared):
                 print(
-                    f"  [{done_count:4d}/{len(work_items)}] "
-                    f"saved={total_saved} | skipped={total_skipped} | "
-                    f"errors={len(errors)} | "
-                    f"{rate:.1f} scans/s | ETA {eta/60:.1f} min"
+                    f"[{i+1:4d}/{len(prepared)}] "
+                    f"saved={total_saved:5d} | "
+                    f"skipped={total_skipped:4d} | "
+                    f"errors={errors:3d}"
                 )
 
-    elapsed_total = time.perf_counter() - t0
-    print(f"\n{'='*55}")
-    print(f"  Preprocessing complete")
-    print(f"{'='*55}")
-    print(f"  Extracted : {total_saved}")
-    print(f"  Skipped   : {total_skipped}")
-    print(f"  Errors    : {len(errors)}")
-    print(f"  Time      : {elapsed_total/60:.1f} min")
-    print(f"  Throughput: {len(work_items)/elapsed_total:.1f} scans/s")
-    print(f"  Workers   : {num_workers}")
-    print(f"  Resampler : monai.transforms.Spacing (bilinear vol / nearest mask)")
+    # ── Final report ──────────────────────────────────────────
+    print("\n" + "=" * 45)
+    print("  PREPROCESSING COMPLETE")
+    print("=" * 45)
+    print(f"  Patients processed : {len(prepared)}")
+    print(f"  Nodule crops saved : {total_saved}")
+    print(f"  Nodules skipped    : {total_skipped}")
+    print(f"  Patients errored   : {errors}")
 
-    print(f"\n  Per-split class counts:")
-    for split in ["train", "val", "test"]:
-        s = split_stats[split]
-        print(f"    {split:6s}: benign={s['benign']:4d} | "
-              f"malignant={s['malignant']:4d} | "
-              f"total={s['benign']+s['malignant']:4d}")
+    print_class_balance(out_dir)
+    write_summary(out_dir, all_results)
 
-    if errors:
-        print(f"\n  ⚠  {len(errors)} scan errors:")
-        for e in errors[:10]:
-            print(f"    {e}")
-        if len(errors) > 10:
-            print(f"    ... and {len(errors)-10} more")
+    # Save error log
+    if error_log:
+        err_path = os.path.join(out_dir, "error_log.json")
+        with open(err_path, "w") as f:
+            json.dump(error_log, f, indent=2)
+        print(f"  Error log saved    → {err_path}")
+        print(f"\n  To retry failed patients, re-run the same command.")
+        print(f"  Successful patients are checkpointed and will be skipped.")
 
 
 # ──────────────────────────────────────────────
@@ -645,35 +748,39 @@ def extract_3d_nodule_volumes(
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="LIDC-IDRI 3D preprocessing: extract 64³ volumes + seg masks "
-                    "(MONAI-native, parallelised)"
+        description="LIDC-IDRI 3D preprocessing — DICOM → 64³ isotropic nodule crops"
     )
-    p.add_argument("--raw_dir",  required=True,
-                   help="Root directory containing raw LIDC-IDRI DICOM data")
-    p.add_argument("--out_dir",  required=True,
-                   help="Output directory for processed 3D volumes")
-    p.add_argument("--min_ann",  type=int, default=2,
-                   help="Minimum radiologist annotations required (default: 2)")
-    p.add_argument("--num_workers", type=int, default=DEFAULT_WORKERS,
-                   help=f"Parallel workers for scan processing (default: {DEFAULT_WORKERS})")
-    p.add_argument("--skip_organise", action="store_true",
-                   help="Skip the folder reorganisation step")
+    p.add_argument(
+        "--raw_dir", required=True,
+        help="Root directory of raw LIDC-IDRI DICOM files",
+    )
+    p.add_argument(
+        "--out_dir", required=True,
+        help="Output directory for processed .npy crops",
+    )
+    p.add_argument(
+        "--workers", type=int,
+        default=max(1, mp.cpu_count() - 1),
+        help="Number of parallel worker processes (default: cpu_count - 1)",
+    )
     return p.parse_args()
 
 
 if __name__ == "__main__":
-    # Force 'spawn' so MONAI + CUDA play nicely in workers
+    # Required for ProcessPoolExecutor on macOS/Windows with spawn start method
     mp.set_start_method("spawn", force=True)
 
     args = parse_args()
 
-    if not args.skip_organise:
-        organise_dicom_folders(args.raw_dir)
+    print("=" * 55)
+    print("  LIDC-IDRI 3D Preprocessing Pipeline")
+    print("=" * 55)
+    print(f"  Raw DICOM dir : {args.raw_dir}")
+    print(f"  Output dir    : {args.out_dir}")
+    print(f"  Workers       : {args.workers}")
+    print(f"  Crop size     : {CROP_SIZE}³ voxels")
+    print(f"  Target spacing: {TARGET_SPACING} mm (isotropic)")
+    print(f"  Min annotators: {MIN_ANNOTATORS}")
+    print("=" * 55 + "\n")
 
-    configure_pylidc(args.raw_dir)
-    extract_3d_nodule_volumes(
-        args.raw_dir,
-        args.out_dir,
-        min_annotators=args.min_ann,
-        num_workers=args.num_workers,
-    )
+    run(args.raw_dir, args.out_dir, args.workers)
