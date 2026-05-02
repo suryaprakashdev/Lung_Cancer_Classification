@@ -10,7 +10,10 @@ Training configuration (from plan diagram):
   - Early stopping on validation AUC, patience=10
   - Temperature calibration after training
 
-Optimized for A100 GPU on Colab Pro.
+Optimized for A100 GPU on Colab Pro with:
+  ▸ MONAI CacheDataset / PersistentDataset for fast data loading
+  ▸ Mixed precision (AMP) training for 2× speedup
+  ▸ TF32 matmuls on A100
 
 Usage:
   python train_classifier.py --data_dir /path/to/processed_3d \\
@@ -19,6 +22,7 @@ Usage:
                               --batch_size 16
 """
 
+import multiprocessing as mp
 import os
 import json
 import argparse
@@ -95,7 +99,8 @@ def train_classifier(model:        nn.Module,
                      save_dir:     str,
                      epochs:       int = 50,
                      patience:     int = 10,
-                     lr:           float = 1e-4) -> float:
+                     lr:           float = 1e-4,
+                     use_amp:      bool = True) -> float:
     """
     Train the 3D ResNet classifier. Returns best val AUC.
 
@@ -110,6 +115,10 @@ def train_classifier(model:        nn.Module,
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-3)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
+    # AMP scaler for mixed precision
+    scaler = torch.amp.GradScaler(enabled=use_amp and device.type == "cuda")
+    amp_dtype = torch.float16 if use_amp and device.type == "cuda" else torch.float32
+
     best_auc         = 0.0
     patience_counter = 0
     history          = []
@@ -123,6 +132,7 @@ def train_classifier(model:        nn.Module,
     print(f"  Loss: BCE + pos_wt={pos_weight.item():.2f}")
     print(f"  Optimizer: AdamW lr={lr}")
     print(f"  Patience: {patience}  |  Epochs: {epochs}")
+    print(f"  AMP: {use_amp and device.type == 'cuda'}")
     print(f"{'='*55}\n")
 
     for epoch in range(epochs):
@@ -134,13 +144,17 @@ def train_classifier(model:        nn.Module,
                     leave=False)
 
         for batch in loop:
-            imgs   = batch["image"].to(device)
-            labels = batch["label"].float().unsqueeze(1).to(device)
+            imgs   = batch["image"].to(device, non_blocking=True)
+            labels = batch["label"].float().unsqueeze(1).to(device, non_blocking=True)
 
-            optimizer.zero_grad()
-            loss = criterion(model(imgs), labels)
-            loss.backward()
-            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+
+            with torch.amp.autocast(device_type=device.type, dtype=amp_dtype):
+                loss = criterion(model(imgs), labels)
+
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
 
             epoch_loss += loss.item()
             loop.set_postfix(loss=f"{loss.item():.4f}")
@@ -201,11 +215,17 @@ def main(args):
     if device.type == "cuda":
         print(f"GPU: {torch.cuda.get_device_name(0)}")
         print(f"VRAM: {torch.cuda.get_device_properties(0).total_mem / 1e9:.1f} GB")
+        # Enable TF32 on A100 for faster matmuls
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
 
     train_loader, val_loader, test_loader, pos_weight = build_cls_dataloaders(
-        data_dir    = args.data_dir,
-        batch_size  = args.batch_size,
-        num_workers = args.num_workers,
+        data_dir              = args.data_dir,
+        batch_size            = args.batch_size,
+        num_workers           = args.num_workers,
+        cache_rate            = args.cache_rate,
+        persistent_cache_dir  = args.cache_dir,
     )
 
     model = ResNet3D10().to(device)
@@ -222,6 +242,7 @@ def main(args):
         epochs       = args.epochs,
         patience     = args.patience,
         lr           = args.lr,
+        use_amp      = not args.no_amp,
     )
 
     # ── Temperature calibration ──
@@ -255,6 +276,7 @@ def main(args):
 
 
 def parse_args():
+    auto_workers = max(1, mp.cpu_count() - 1)
     p = argparse.ArgumentParser(description="3D ResNet classifier training")
     p.add_argument("--data_dir",    required=True,
                    help="Processed 3D volume directory (output of preprocessing.py)")
@@ -265,7 +287,14 @@ def parse_args():
     p.add_argument("--batch_size",  type=int, default=16,
                    help="Batch size (default: 16 for A100)")
     p.add_argument("--lr",          type=float, default=1e-4)
-    p.add_argument("--num_workers", type=int, default=4)
+    p.add_argument("--num_workers", type=int, default=auto_workers,
+                   help=f"DataLoader workers (default: {auto_workers})")
+    p.add_argument("--cache_rate",  type=float, default=1.0,
+                   help="CacheDataset rate: 1.0=all in RAM (default: 1.0)")
+    p.add_argument("--cache_dir",   type=str, default=None,
+                   help="PersistentDataset cache dir (survives restarts)")
+    p.add_argument("--no_amp",      action="store_true",
+                   help="Disable mixed precision training")
     return p.parse_args()
 
 

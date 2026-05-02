@@ -4,7 +4,10 @@ train_unet.py
 Phase 2: Train the 3D U-Net for nodule segmentation.
 
 Uses DiceCELoss (Dice + CrossEntropy) as specified in the plan.
-Optimized for A100 GPU on Colab Pro.
+Optimized for A100 GPU on Colab Pro with:
+  ▸ MONAI CacheDataset / PersistentDataset for fast data loading
+  ▸ Mixed precision (AMP) training for 2× speedup on A100
+  ▸ Auto num_workers tuned to CPU cores
 
 Usage:
   python train_unet.py --data_dir /path/to/processed_3d \\
@@ -13,6 +16,7 @@ Usage:
                        --batch_size 8
 """
 
+import multiprocessing as mp
 import os
 import json
 import argparse
@@ -74,7 +78,8 @@ def train_unet(model: nn.Module,
                save_dir: str,
                epochs: int = 100,
                patience: int = 15,
-               lr: float = 1e-3) -> float:
+               lr: float = 1e-3,
+               use_amp: bool = True) -> float:
     """
     Train the 3D U-Net and return the best validation Dice score.
 
@@ -96,6 +101,10 @@ def train_unet(model: nn.Module,
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
+    # AMP scaler for mixed precision (2× speedup on A100)
+    scaler = torch.amp.GradScaler(enabled=use_amp and device.type == "cuda")
+    amp_dtype = torch.float16 if use_amp and device.type == "cuda" else torch.float32
+
     best_dice        = 0.0
     patience_counter = 0
     history          = []
@@ -108,6 +117,7 @@ def train_unet(model: nn.Module,
     print(f"{'='*55}")
     print(f"  Loss: DiceCELoss  |  Optimizer: AdamW lr={lr}")
     print(f"  Patience: {patience}  |  Epochs: {epochs}")
+    print(f"  AMP: {use_amp and device.type == 'cuda'}")
     print(f"{'='*55}\n")
 
     for epoch in range(epochs):
@@ -119,14 +129,18 @@ def train_unet(model: nn.Module,
                     leave=False)
 
         for batch in loop:
-            images = batch["image"].to(device)
-            masks  = batch["mask"].to(device)
+            images = batch["image"].to(device, non_blocking=True)
+            masks  = batch["mask"].to(device, non_blocking=True)
 
-            optimizer.zero_grad()
-            outputs = model(images)
-            loss = criterion(outputs, masks)
-            loss.backward()
-            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+
+            with torch.amp.autocast(device_type=device.type, dtype=amp_dtype):
+                outputs = model(images)
+                loss = criterion(outputs, masks)
+
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
 
             epoch_loss += loss.item()
             loop.set_postfix(loss=f"{loss.item():.4f}")
@@ -187,11 +201,17 @@ def main(args):
     if device.type == "cuda":
         print(f"GPU: {torch.cuda.get_device_name(0)}")
         print(f"VRAM: {torch.cuda.get_device_properties(0).total_mem / 1e9:.1f} GB")
+        # Enable TF32 on A100 for faster matmuls
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
 
     train_loader, val_loader, test_loader = build_seg_dataloaders(
-        data_dir    = args.data_dir,
-        batch_size  = args.batch_size,
-        num_workers = args.num_workers,
+        data_dir              = args.data_dir,
+        batch_size            = args.batch_size,
+        num_workers           = args.num_workers,
+        cache_rate            = args.cache_rate,
+        persistent_cache_dir  = args.cache_dir,
     )
 
     model = UNet3D().to(device)
@@ -207,6 +227,7 @@ def main(args):
         epochs       = args.epochs,
         patience     = args.patience,
         lr           = args.lr,
+        use_amp      = not args.no_amp,
     )
 
     # Evaluate on test set
@@ -224,6 +245,7 @@ def main(args):
 
 
 def parse_args():
+    auto_workers = max(1, mp.cpu_count() - 1)
     p = argparse.ArgumentParser(description="3D U-Net segmentation training")
     p.add_argument("--data_dir",    required=True,
                    help="Processed 3D volume directory (output of preprocessing.py)")
@@ -234,7 +256,14 @@ def parse_args():
     p.add_argument("--batch_size",  type=int, default=8,
                    help="Batch size (default: 8 for A100)")
     p.add_argument("--lr",          type=float, default=1e-3)
-    p.add_argument("--num_workers", type=int, default=4)
+    p.add_argument("--num_workers", type=int, default=auto_workers,
+                   help=f"DataLoader workers (default: {auto_workers})")
+    p.add_argument("--cache_rate",  type=float, default=1.0,
+                   help="CacheDataset rate: 1.0=all in RAM, 0.5=half (default: 1.0)")
+    p.add_argument("--cache_dir",   type=str, default=None,
+                   help="PersistentDataset cache dir (survives restarts)")
+    p.add_argument("--no_amp",      action="store_true",
+                   help="Disable mixed precision training")
     return p.parse_args()
 
 
